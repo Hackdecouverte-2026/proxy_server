@@ -1,4 +1,5 @@
 import os
+import base64
 import socket
 import select
 import hashlib
@@ -36,14 +37,34 @@ def authenticate(handler):
     value = handler.headers.get("Proxy-Authorization", "")
 
     scheme, _, token = value.partition(" ")
+    scheme = scheme.lower()
 
-    if scheme.lower() != "bearer" or not token:
+    username = None
+
+    if scheme == "basic":
+        # System proxy dialogs send Basic base64(username:password).
+        try:
+            decoded = base64.b64decode(token).decode("utf-8")
+        except Exception:
+            return None
+
+        username, _, token = decoded.partition(":")
+
+    elif scheme != "bearer":
+        return None
+
+    if not token:
         return None
 
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     with flask_app.app_context():
-        user = User.query.filter_by(token_hash=digest, active=True).first()
+        query = User.query.filter_by(token_hash=digest, active=True)
+
+        if username:
+            query = query.filter_by(username=username)
+
+        user = query.first()
 
         if user:
             return user.id
@@ -87,6 +108,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             format % args,
         )
 
+    def challenge(self):
+        # RFC 7235: a 407 must carry Proxy-Authenticate so clients
+        # know to prompt and retry.
+        self.send_response(407, "Proxy Authentication Required")
+        self.send_header("Proxy-Authenticate", 'Basic realm="proxy"')
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
     def authorize(self):
 
         user_id = authenticate(self)
@@ -98,7 +129,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.client_address[1],
                 self.path,
             )
-            self.send_error(407, "Proxy authentication required")
+            self.challenge()
             return None
 
         logger.info(
