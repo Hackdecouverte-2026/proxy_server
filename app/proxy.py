@@ -22,6 +22,10 @@ ALLOWED_HOSTS = {
     h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()
 }
 
+FORBIDDEN_HOSTS = {
+    h.strip().lower() for h in os.getenv("FORBIDDEN_HOSTS", "").split(",") if h.strip()
+}
+
 MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", "10485760"))
 
 logging.basicConfig(
@@ -55,8 +59,13 @@ def validate_destination(host, port):
 
     host = host.lower().rstrip(".")
 
+    # if host not allowed
     if host not in ALLOWED_HOSTS:
-        raise ValueError("Destination not allowed")
+
+        if host in FORBIDDEN_HOSTS:
+            raise ValueError("Destination not allowed")
+        else:
+            print(f"Unknown host: {host}")
 
     if port not in (80, 443):
         raise ValueError("Destination port not allowed")
@@ -79,7 +88,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):
-        # Avoid logging credentials or complete URLs.
         logger.info(
             "client=%s:%s %s",
             self.client_address[0],
