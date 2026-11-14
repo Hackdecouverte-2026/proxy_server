@@ -1,16 +1,16 @@
+import hashlib
 import os
 import secrets
-import hashlib
-from flask import Flask, request, jsonify, current_app
-from sqlalchemy import select
+
 from config import Config
 from database import db, init_database
-from models import User, AccessLog
+from flask import Flask, current_app, jsonify, request
+from models import AccessLog, User
+from sqlalchemy import select
+
 
 def hash_token(token):
-    return hashlib.sha256(
-        token.encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def create_app():
@@ -29,12 +29,11 @@ def create_app():
 
     def admin_required():
 
-    supplied = request.headers.get("X-Admin-Key", "")
-    expected = current_app.config["ADMIN_API_KEY"]
+        supplied = request.headers.get("X-Admin-Key", "")
+        expected = current_app.config["ADMIN_API_KEY"]
 
-    return secrets.compare_digest(supplied, expected)
+        return secrets.compare_digest(supplied, expected)
 
- 
     @app.route("/health")
     def health():
         return jsonify({"status": "ok"})
@@ -57,22 +56,20 @@ def create_app():
 
         token = secrets.token_urlsafe(32)
 
-        user = User(
-            username=username,
-            token_hash=hash_token(token),
-            active=True
-        )
+        user = User(username=username, token_hash=hash_token(token), active=True)
 
         db.session.add(user)
         db.session.commit()
 
         # Return the plaintext token only once.
-        return jsonify({
-            "id": user.id,
-            "username": user.username,
-            "token": token,
-            "active": user.active
-        }), 201
+        return jsonify(
+            {
+                "id": user.id,
+                "username": user.username,
+                "token": token,
+                "active": user.active,
+            }
+        ), 201
 
     @app.route("/admin/users", methods=["GET"])
     def list_users():
@@ -82,19 +79,18 @@ def create_app():
 
         users = User.query.order_by(User.id).all()
 
-        return jsonify([
-            {
-                "id": u.id,
-                "username": u.username,
-                "active": u.active,
-                "created_at": u.created_at.isoformat(),
-                "last_used": (
-                    u.last_used.isoformat()
-                    if u.last_used else None
-                )
-            }
-            for u in users
-        ])
+        return jsonify(
+            [
+                {
+                    "id": u.id,
+                    "username": u.username,
+                    "active": u.active,
+                    "created_at": u.created_at.isoformat(),
+                    "last_used": (u.last_used.isoformat() if u.last_used else None),
+                }
+                for u in users
+            ]
+        )
 
     @app.route("/admin/users/<int:user_id>", methods=["DELETE"])
     def revoke_user(user_id):
@@ -110,9 +106,6 @@ def create_app():
         user.active = False
         db.session.commit()
 
-        return jsonify({
-            "message": "User disabled",
-            "user_id": user.id
-        })
+        return jsonify({"message": "User disabled", "user_id": user.id})
 
     return app
