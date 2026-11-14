@@ -15,42 +15,31 @@ from models import db, User, AccessLog
 flask_app = create_app()
 
 ALLOWED_HOSTS = {
-    h.strip().lower()
-    for h in os.getenv("ALLOWED_HOSTS", "").split(",")
-    if h.strip()
+    h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()
 }
 
-MAX_REQUEST_SIZE = int(
-    os.getenv("MAX_REQUEST_SIZE", "10485760")
-)
+MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", "10485760"))
 
 
 def authenticate(handler):
 
-    value = handler.headers.get(
-        "Proxy-Authorization", ""
-    )
+    value = handler.headers.get("Proxy-Authorization", "")
 
     scheme, _, token = value.partition(" ")
 
     if scheme.lower() != "bearer" or not token:
         return None
 
-    digest = hashlib.sha256(
-        token.encode("utf-8")
-    ).hexdigest()
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     with flask_app.app_context():
-
-        user = User.query.filter_by(
-            token_hash=digest,
-            active=True
-        ).first()
+        user = User.query.filter_by(token_hash=digest, active=True).first()
 
         if user:
             return user.id
 
     return None
+
 
 def validate_destination(host, port):
 
@@ -62,11 +51,7 @@ def validate_destination(host, port):
     if port not in (80, 443):
         raise ValueError("Destination port not allowed")
 
-    results = socket.getaddrinfo(
-        host,
-        port,
-        type=socket.SOCK_STREAM
-    )
+    results = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
 
     if not results:
         raise ValueError("DNS resolution failed")
@@ -81,7 +66,6 @@ def validate_destination(host, port):
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
-
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):
@@ -101,12 +85,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def record(self, user_id, host, status):
 
         with flask_app.app_context():
-
             log = AccessLog(
-                user_id=user_id,
-                method=self.command,
-                hostname=host[:255],
-                status=status
+                user_id=user_id, method=self.command, hostname=host[:255], status=status
             )
 
             db.session.add(log)
@@ -115,6 +95,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             if user:
                 from datetime import datetime, timezone
+
                 user.last_used = datetime.now(timezone.utc)
 
             db.session.commit()
@@ -132,10 +113,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             host = validate_destination(host, port)
 
-            remote = socket.create_connection(
-                (host, port),
-                timeout=10
-            )
+            remote = socket.create_connection((host, port), timeout=10)
 
             self.send_response(200, "Connection Established")
             self.end_headers()
@@ -146,19 +124,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             sockets = [self.connection, remote]
 
             while True:
-
-                readable, _, exceptional = select.select(
-                    sockets, [], sockets, 60
-                )
+                readable, _, exceptional = select.select(sockets, [], sockets, 60)
 
                 if exceptional or not readable:
                     break
 
                 for source in readable:
-
                     destination = (
-                        remote if source is self.connection
-                        else self.connection
+                        remote if source is self.connection else self.connection
                     )
 
                     data = source.recv(65536)
@@ -193,10 +166,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Invalid HTTP proxy URL")
                 return
 
-            host = validate_destination(
-                parsed.hostname,
-                parsed.port or 80
-            )
+            host = validate_destination(parsed.hostname, parsed.port or 80)
 
             length = int(self.headers.get("Content-Length", "0"))
 
@@ -206,20 +176,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             body = self.rfile.read(length) if length else None
 
-            conn = http.client.HTTPConnection(
-                host,
-                parsed.port or 80,
-                timeout=30
-            )
+            conn = http.client.HTTPConnection(host, parsed.port or 80, timeout=30)
 
             headers = {
-                k: v for k, v in self.headers.items()
-                if k.lower() not in (
+                k: v
+                for k, v in self.headers.items()
+                if k.lower()
+                not in (
                     "proxy-authorization",
                     "proxy-connection",
                     "connection",
                     "host",
-                    "transfer-encoding"
+                    "transfer-encoding",
                 )
             }
 
@@ -230,24 +198,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if parsed.query:
                 path += "?" + parsed.query
 
-            conn.request(
-                self.command,
-                path,
-                body=body,
-                headers=headers
-            )
+            conn.request(self.command, path, body=body, headers=headers)
 
             response = conn.getresponse()
 
             self.send_response(response.status)
 
             for key, value in response.getheaders():
-
-                if key.lower() not in (
-                    "connection",
-                    "transfer-encoding",
-                    "keep-alive"
-                ):
+                if key.lower() not in ("connection", "transfer-encoding", "keep-alive"):
                     self.send_header(key, value)
 
             self.send_header("Connection", "close")
@@ -280,13 +238,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-
     server = ThreadingHTTPServer(
-        (
-            os.getenv("PROXY_HOST", "0.0.0.0"),
-            int(os.getenv("PROXY_PORT", "8888"))
-        ),
-        ProxyHandler
+        (os.getenv("PROXY_HOST", "0.0.0.0"), int(os.getenv("PROXY_PORT", "8888"))),
+        ProxyHandler,
     )
 
     server.daemon_threads = True
