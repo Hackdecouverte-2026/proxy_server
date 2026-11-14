@@ -16,7 +16,9 @@ class User(db.Model):
 
     active = db.Column(db.Boolean, default=True, nullable=False)
 
-    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = db.Column(
+        db.DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc)
+    )
 
     last_used = db.Column(db.DateTime, nullable=True)
 
@@ -32,4 +34,6 @@ class AccessLog(db.Model):
     hostname = db.Column(db.String(255))
     status = db.Column(db.Integer)
 
-    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = db.Column(
+        db.DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc)
+    )

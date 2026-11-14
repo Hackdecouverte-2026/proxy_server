@@ -38,6 +38,29 @@ def create_app():
     def health():
         return jsonify({"status": "ok"})
 
+    @app.route("/auth", methods=["POST"])
+    def auth():
+
+        data = request.get_json(silent=True) or {}
+
+        entra_id = data.get("entra_id", "").strip()
+
+        if not entra_id or len(entra_id) > 100:
+            return jsonify({"error": "Invalid entra_id"}), 400
+
+        user = User.query.filter_by(username=entra_id, active=True).first()
+
+        if not user:
+            return jsonify({"error": "User not allowed"}), 403
+
+        token = secrets.token_urlsafe(32)
+
+        user.token_hash = hash_token(token)
+
+        db.session.commit()
+
+        return jsonify({"token": token})
+
     @app.route("/admin/users", methods=["POST"])
     def create_user():
 
