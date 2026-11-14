@@ -2,8 +2,6 @@ import os
 import base64
 import socket
 import select
-import hashlib
-import secrets
 import time
 import http.client
 import ipaddress
@@ -14,10 +12,13 @@ from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from admin import create_app
-from models import db, User, AccessLog
+from auth import hash_token, utcnow
+from models import db, User, AccessLog, Credential
 
 
 flask_app = create_app()
+
+PROXY_REALM = flask_app.config["PROXY_REALM"]
 
 ALLOWED_HOSTS = {
     h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()
@@ -33,43 +34,53 @@ logger = logging.getLogger("proxy")
 
 
 def authenticate(handler):
+    """RFC 7617 Basic only: base64(entra-upn:device-credential).
+
+    The username carries the identity, the password is the per-device
+    credential issued by /enroll. Returns (user_id, credential_id, username).
+    """
 
     value = handler.headers.get("Proxy-Authorization", "")
 
-    scheme, _, token = value.partition(" ")
-    scheme = scheme.lower()
+    scheme, _, payload = value.partition(" ")
 
-    username = None
-
-    if scheme == "basic":
-        # System proxy dialogs send Basic base64(username:password).
-        try:
-            decoded = base64.b64decode(token).decode("utf-8")
-        except Exception:
-            return None
-
-        username, _, token = decoded.partition(":")
-
-    elif scheme != "bearer":
+    if scheme.lower() != "basic":
         return None
 
-    if not token:
+    try:
+        decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+    except Exception:
         return None
 
-    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    username, separator, token = decoded.partition(":")
+
+    username = username.strip().lower()
+
+    if not separator or not username or not token:
+        return None
+
+    digest = hash_token(token)
 
     with flask_app.app_context():
-        query = User.query.filter_by(token_hash=digest, active=True)
+        credential = Credential.query.filter_by(token_hash=digest).first()
 
-        if username:
-            query = query.filter_by(username=username)
+        if not credential or not credential.usable(utcnow()):
+            return None
 
-        user = query.first()
+        user = db.session.get(User, credential.user_id)
 
-        if user:
-            return user.id
+        if not user or not user.active or user.username != username:
+            return None
 
-    return None
+        return user.id, credential.id, user.username
+
+
+class DeniedError(ValueError):
+    """Destination refused by policy. ``reason`` is stored in access_logs."""
+
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
 
 
 def validate_destination(host, port):
@@ -77,10 +88,10 @@ def validate_destination(host, port):
     host = host.lower().rstrip(".")
 
     if host not in ALLOWED_HOSTS:
-        raise ValueError("Destination not allowed")
+        raise DeniedError("not_allowed", "Destination not allowed")
 
     if port not in (80, 443):
-        raise ValueError("Destination port not allowed")
+        raise DeniedError("port_not_allowed", "Destination port not allowed")
 
     results = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
 
@@ -91,7 +102,7 @@ def validate_destination(host, port):
         ip = ipaddress.ip_address(result[4][0])
 
         if not ip.is_global:
-            raise ValueError("Non-public destination")
+            raise DeniedError("non_public", "Non-public destination")
 
     return host
 
@@ -112,29 +123,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # RFC 7235: a 407 must carry Proxy-Authenticate so clients
         # know to prompt and retry.
         self.send_response(407, "Proxy Authentication Required")
-        self.send_header("Proxy-Authenticate", 'Basic realm="proxy"')
+        self.send_header(
+            "Proxy-Authenticate", f'Basic realm="{PROXY_REALM}", charset="UTF-8"'
+        )
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
 
+    credential_id = None
+    username = None
+
     def authorize(self):
 
-        user_id = authenticate(self)
+        identity = authenticate(self)
 
-        if not user_id:
+        if not identity:
             logger.warning(
                 "auth failed client=%s:%s path=%r",
                 self.client_address[0],
                 self.client_address[1],
                 self.path,
             )
-            self.challenge()
+            self.deny(None, 407, "auth_failed", "Proxy Authentication Required")
             return None
 
+        user_id, credential_id, username = identity
+
+        self.credential_id = credential_id
+        self.username = username
+
         logger.info(
-            "auth ok user_id=%s client=%s:%s path=%r",
+            "auth ok user=%s user_id=%s credential_id=%s client=%s:%s path=%r",
+            username,
             user_id,
+            credential_id,
             self.client_address[0],
             self.client_address[1],
             self.path,
@@ -142,19 +165,56 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         return user_id
 
-    def record(self, user_id, host, status):
+    def request_host(self):
+        """Best-effort target host of the current request, for logging."""
+
+        if self.command == "CONNECT":
+            return self.path.rsplit(":", 1)[0].lower()
+
+        return (urlsplit(self.path).hostname or "").lower()
+
+    def deny(self, user_id, status, reason, message):
+        """Reply with an error and log the rejected request."""
+
+        try:
+            self.record(user_id, self.request_host(), status, reason)
+        except Exception:
+            logger.exception("failed to record denied request")
+
+        if status == 407:
+            self.challenge()
+        else:
+            self.send_error(status, message)
+
+    def record(self, user_id, host, status, reason=None):
 
         with flask_app.app_context():
             log = AccessLog(
-                user_id=user_id, method=self.command, hostname=host[:255], status=status
+                user_id=user_id,
+                credential_id=self.credential_id,
+                method=self.command,
+                hostname=host[:255],
+                status=status,
+                reason=reason,
             )
 
             db.session.add(log)
 
-            user = db.session.get(User, user_id)
+            now = datetime.now(timezone.utc)
+
+            user = db.session.get(User, user_id) if user_id else None
 
             if user:
-                user.last_used = datetime.now(timezone.utc)
+                user.last_used = now
+
+            credential = (
+                db.session.get(Credential, self.credential_id)
+                if self.credential_id
+                else None
+            )
+
+            if credential:
+                credential.last_used = now
 
             db.session.commit()
 
@@ -226,6 +286,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 bytes_up + bytes_down,
                 time.monotonic() - started,
             )
+
+        except DeniedError as exc:
+            logger.warning(
+                "tunnel denied user_id=%s path=%r reason=%s",
+                user_id,
+                self.path,
+                exc.reason,
+            )
+            self.deny(user_id, 403, exc.reason, "Forbidden")
 
         except Exception:
             logger.exception(
@@ -325,6 +394,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             conn.close()
 
+        except DeniedError as exc:
+            logger.warning(
+                "forward denied user_id=%s path=%r reason=%s",
+                user_id,
+                self.path,
+                exc.reason,
+            )
+            self.deny(user_id, 403, exc.reason, "Forbidden")
+
         except Exception:
             logger.exception(
                 "forward failed user_id=%s path=%r", user_id, self.path
@@ -349,10 +427,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
 
         client = flask_app.test_client()
+
+        # /enroll needs the Entra bearer token, admin routes the admin key,
+        # /dev/enroll the dev key.
+        headers = {
+            key: value
+            for key, value in self.headers.items()
+            if key.lower() in ("authorization", "x-admin-key", "x-dev-key")
+        }
+
         resp = client.open(
             self.path,
             method=self.command,
             data=body,
+            headers=headers,
             content_type=self.headers.get("Content-Type"),
         )
 
@@ -399,7 +487,8 @@ if __name__ == "__main__":
     server.daemon_threads = True
 
     logger.info(
-        "forward proxy listening on %s:%s",
+        "forward proxy (Basic auth, realm=%r) listening on %s:%s",
+        PROXY_REALM,
         os.getenv("PROXY_HOST", "0.0.0.0"),
         os.getenv("PROXY_PORT", "8888"),
     )
