@@ -80,7 +80,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         # Avoid logging credentials or complete URLs.
-        self.logger.info("client=%s:%s %s", self.client_address[0], self.client_address[1], format % args)
+        logger.info(
+            "client=%s:%s %s",
+            self.client_address[0],
+            self.client_address[1],
+            format % args,
+        )
 
     def authorize(self):
 
